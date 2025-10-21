@@ -339,6 +339,7 @@ class DiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # Forward diffusion.
+        # 干净的动作轨迹（expert）
         trajectory = batch[ACTION]
         # Sample noise to add to the trajectory.
         eps = torch.randn(trajectory.shape, device=trajectory.device)
@@ -350,6 +351,15 @@ class DiffusionModel(nn.Module):
             device=trajectory.device,
         ).long()
         # Add noise to the clean trajectories according to the noise magnitude at each timestep.
+        '''
+        DDPM前向传播 x_t = sqrt(ᾱ_t) * x_0 + sqrt(1 - ᾱ_t) * ε
+        其中:
+        - x_0: 干净的动作 (trajectory)
+        - ε: 采样的噪声 (eps)
+        - t: 时间步 (timesteps)
+        - ᾱ_t: 累积噪声系数 (由scheduler管理)
+        alpha_t就决定了噪声的累积分布大小
+        '''
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
@@ -357,6 +367,7 @@ class DiffusionModel(nn.Module):
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
+        # 预测是噪声可以反推出 x_0 = (x_t - sqrt(1-ᾱ_t)*ε) / sqrt(ᾱ_t)
         if self.config.prediction_type == "epsilon":
             target = eps
         elif self.config.prediction_type == "sample":

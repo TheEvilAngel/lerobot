@@ -108,6 +108,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             copied `n_obs_steps` times to fill the cache).
           - The diffusion model generates `horizon` steps worth of actions.
           - `n_action_steps` worth of actions are actually kept for execution, starting from the current step.
+        总长度为h，其中过去有o个，未来就有h-o个，每次只执行a步
         Schematically this looks like:
             ----------------------------------------------------------------------------------------------
             (legend: o = n_obs_steps, h = horizon, a = n_action_steps)
@@ -198,6 +199,7 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = config.num_inference_steps
 
     # ========= inference  ============
+    # DDPM
     def conditional_sample(
         self,
         batch_size: int,
@@ -219,28 +221,38 @@ class DiffusionModel(nn.Module):
                 generator=generator,
             )
         )
-
+        # 去噪声时间步骤，按照self.num_inference_steps为间隔
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
             # Predict model output.
+            # 告诉当前的sample（循环利用了其实就是sample_t），当前时间步（告诉unet该精细调整还是粗略判断），以及状态
             model_output = self.unet(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                 global_cond=global_cond,
             )
             # Compute previous image: x_t -> x_t-1
+            # DDPM公式去噪
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode image features and concatenate them all together along with the state vector."""
+        """Encode image features and concatenate them all together along with the state vector.
+        batch = 
+        {
+            OBS_STATE: Tensor,      # shape: (B, n_obs_steps, state_dim) 机器人相关信息
+            OBS_IMAGES: Tensor,     # shape: (B, n_obs_steps, n_cameras, C, H, W)
+            OBS_ENV_STATE: Tensor,  # shape: (B, n_obs_steps, env_state_dim)
+        }
+        output = # shape: (B, global_cond_dim)
+        """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
         # Extract image features.
         if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
+            if self.config.use_separate_rgb_encoder_per_camera: # 每个相机不同编码器（不同resnet18）
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
                 img_features_list = torch.cat(
@@ -287,9 +299,11 @@ class DiffusionModel(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
+        # 相当于就是把image进行了前置编码，每个相机全部融合到一起
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
+        # DDPM去噪
         actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).

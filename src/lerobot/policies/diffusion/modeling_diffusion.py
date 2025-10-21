@@ -640,7 +640,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         # Encoder for the diffusion timestep.
         self.diffusion_step_encoder = nn.Sequential(
-            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim), # 时间步骤进行编码
             nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
             nn.Mish(),
             nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
@@ -651,6 +651,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
         # just reverse these.
+        # 下采样的维度
         in_out = [(config.action_feature.shape[0], config.down_dims[0])] + list(
             zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
@@ -662,6 +663,11 @@ class DiffusionConditionalUnet1d(nn.Module):
             "n_groups": config.n_groups,
             "use_film_scale_modulation": config.use_film_scale_modulation,
         }
+        '''
+        层级0: (B, 7, 16)   → ResBlock → (B, 256, 16) → ResBlock → (B, 256, 16) → Downsample → (B, 256, 8)
+        层级1: (B, 256, 8)  → ResBlock → (B, 512, 8)  → ResBlock → (B, 512, 8)  → Downsample → (B, 512, 4)
+        层级2: (B, 512, 4)  → ResBlock → (B, 1024, 4) → ResBlock → (B, 1024, 4) → Identity   → (B, 1024, 4)
+        '''
         self.down_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (len(in_out) - 1)
@@ -720,28 +726,66 @@ class DiffusionConditionalUnet1d(nn.Module):
             (B, T, input_dim) diffusion model prediction.
         """
         # For 1D convolutions we'll need feature dimension first.
-        x = einops.rearrange(x, "b t d -> b d t")
+        x = einops.rearrange(x, "b t d -> b d t") # 因为1d卷积是b，c，l
 
-        timesteps_embed = self.diffusion_step_encoder(timestep)
+        timesteps_embed = self.diffusion_step_encoder(timestep) # b, d, diffusion_step_embed_dim
 
         # If there is a global conditioning feature, concatenate it to the timestep embedding.
         if global_cond is not None:
-            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
+            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1) # b, d, diffusion_step_embed_dim
         else:
             global_feature = timesteps_embed
 
         # Run encoder, keeping track of skip features to pass to the decoder.
         encoder_skip_features: list[Tensor] = []
+        '''
+        # 初始: x = (4, 7, 16)
+
+        # === 层级0 ===
+        x = resnet(x, global_feature)   # (4, 7, 16) → (4, 256, 16)
+        x = resnet2(x, global_feature)  # (4, 256, 16) → (4, 256, 16)
+        encoder_skip_features.append(x)  # 保存 (4, 256, 16)
+        x = downsample(x)               # (4, 256, 16) → (4, 256, 8)
+
+        # === 层级1 ===
+        x = resnet(x, global_feature)   # (4, 256, 8) → (4, 512, 8)
+        x = resnet2(x, global_feature)  # (4, 512, 8) → (4, 512, 8)
+        encoder_skip_features.append(x)  # 保存 (4, 512, 8)
+        x = downsample(x)               # (4, 512, 8) → (4, 512, 4)
+
+        # === 层级2 ===
+        x = resnet(x, global_feature)   # (4, 512, 4) → (4, 1024, 4)
+        x = resnet2(x, global_feature)  # (4, 1024, 4) → (4, 1024, 4)
+        encoder_skip_features.append(x)  # 保存 (4, 1024, 4)
+        x = Identity(x)                 # (4, 1024, 4) → (4, 1024, 4)
+
+        # 跳跃连接列表: [(4, 256, 16), (4, 512, 8), (4, 1024, 4)]
+        '''
         for resnet, resnet2, downsample in self.down_modules:
             x = resnet(x, global_feature)
             x = resnet2(x, global_feature)
             encoder_skip_features.append(x)
-            x = downsample(x)
+            x = downsample(x) # 此处才进行了下采样
 
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
 
         # Run decoder, using the skip features from the encoder.
+        '''
+        # === 层级0 ===
+        skip = encoder_skip_features.pop()  # 取出 (4, 1024, 4)
+        x = torch.cat((x, skip), dim=1)     # (4, 1024, 4) + (4, 1024, 4) → (4, 2048, 4)
+        x = resnet(x, global_feature)       # (4, 2048, 4) → (4, 512, 4)
+        x = resnet2(x, global_feature)      # (4, 512, 4) → (4, 512, 4)
+        x = upsample(x)                     # (4, 512, 4) → (4, 512, 8)  # 上采样
+
+        # === 层级1 ===
+        skip = encoder_skip_features.pop()  # 取出 (4, 512, 8)
+        x = torch.cat((x, skip), dim=1)     # (4, 512, 8) + (4, 512, 8) → (4, 1024, 8)
+        x = resnet(x, global_feature)       # (4, 1024, 8) → (4, 256, 8)
+        x = resnet2(x, global_feature)      # (4, 256, 8) → (4, 256, 8)
+        x = Identity(x)                     # (4, 256, 8) → (4, 256, 8)
+        '''
         for resnet, resnet2, upsample in self.up_modules:
             x = torch.cat((x, encoder_skip_features.pop()), dim=1)
             x = resnet(x, global_feature)
@@ -750,7 +794,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         x = self.final_conv(x)
 
-        x = einops.rearrange(x, "b d t -> b t d")
+        x = einops.rearrange(x, "b d t -> b t d") # still b,t,d
         return x
 
 
@@ -800,6 +844,7 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         cond_embed = self.cond_encoder(cond).unsqueeze(-1)
         if self.use_film_scale_modulation:
             # Treat the embedding as a list of scales and biases.
+            # 多了两个通道，linear层出来的一个用来进行scale，一个用来进行bias
             scale = cond_embed[:, : self.out_channels]
             bias = cond_embed[:, self.out_channels :]
             out = scale * out + bias

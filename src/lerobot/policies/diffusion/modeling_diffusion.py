@@ -411,6 +411,25 @@ class SpatialSoftmax(nn.Module):
     The example above results in 512 keypoints (corresponding to the 512 input channels). We can optionally
     provide num_kp != None to control the number of keypoints. This is achieved by a first applying a learnable
     linear mapping (in_channels, H, W) -> (num_kp, H, W).
+    相当于只要num_kp个关键点，然后告诉关键点的坐标
+    物理意义：
+    原始特征图（某个通道）:
+    ┌─────────────┐
+    │ . . . . . . │
+    │ . . ● . . . │  ← ●表示高激活区域
+    │ . . . . . . │
+    │ . . . . . . │
+    └─────────────┘
+
+    Softmax后（注意力权重）:
+    ┌─────────────┐
+    │ 0.01 0.01 0.01
+    │ 0.01 0.89 0.02  ← 高权重
+    │ 0.01 0.01 0.01
+    │ 0.01 0.01 0.01
+    └─────────────┘
+
+    计算质心 → 关键点: (x, y)
     """
 
     def __init__(self, input_shape, num_kp=None):
@@ -433,6 +452,7 @@ class SpatialSoftmax(nn.Module):
 
         # we could use torch.linspace directly but that seems to behave slightly differently than numpy
         # and causes a small degradation in pc_success of pre-trained models.
+        # 将像素位置归一化到-1～+1
         pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
         pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
         pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
@@ -509,9 +529,12 @@ class DiffusionRgbEncoder(nn.Module):
         images_shape = next(iter(config.image_features.values())).shape
         dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
+
+        # 可以学习，一个假的输入得到最后featuremap.shape
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        # 最大创新，提取最核心的点
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints) 
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
         self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
         self.relu = nn.ReLU()
@@ -531,7 +554,7 @@ class DiffusionRgbEncoder(nn.Module):
                 # Always use center crop for eval.
                 x = self.center_crop(x)
         # Extract backbone feature.
-        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
+        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1) # [b, num_kp, 2] -> [b, num_kp*2]
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))
         return x
@@ -541,6 +564,7 @@ def _replace_submodules(
     root_module: nn.Module, predicate: Callable[[nn.Module], bool], func: Callable[[nn.Module], nn.Module]
 ) -> nn.Module:
     """
+    将batch_norm替换成group_norm
     Args:
         root_module: The module for which the submodules need to be replaced
         predicate: Takes a module as an argument and must return True if the that module is to be replaced.

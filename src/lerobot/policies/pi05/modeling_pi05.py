@@ -97,11 +97,27 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
     setup several types of attention, for example:
 
-      [[1 1 1 1 1 1]]: pure causal attention.
+    cumsum[:, None, :] <= cumsum[:, :, None]执行后
+
+      [[1 1 1 1 1 1]]: pure causal attention. 纯因果序列
+    
+        [[1, 0, 0, 0, 0, 0],
+        [1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 0, 0],
+        [1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1]]
 
       [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
           themselves and the last 3 tokens have a causal attention. The first
-          entry could also be a 1 without changing behaviour.
+          entry could also be a 1 without changing behaviour. 前三个彼此能看见
+
+        [[1, 1, 1, 0, 0, 0],
+        [1, 1, 1, 0, 0, 0],
+        [1, 1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 0, 0],
+        [1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1]]
 
       [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
           block can attend all previous blocks and all tokens on the same block.
@@ -116,10 +132,10 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
-    cumsum = torch.cumsum(att_masks, dim=1)
-    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    cumsum = torch.cumsum(att_masks, dim=1) # 从左到右进行累加和
+    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None] # 因果掩码实现，每个位置只能看到自己和自己之前的token
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-    return att_2d_masks & pad_2d_masks
+    return att_2d_masks & pad_2d_masks # 掩码怎么都看不到
 
 
 def pad_vector(vector, new_dim):
@@ -216,18 +232,23 @@ def compute_layer_complete(
     key_states = []
     value_states = []
     gates = []
-    for i, hidden_states in enumerate(inputs_embeds):
+    for i, hidden_states in enumerate(inputs_embeds): # i=0: prefix, i=1: suffix
         layer = models[i].layers[layer_idx]
+
+        # AdaRMS 归一化 (只有suffix使用adarms_cond)
         hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+        
+        #计算qkv
         query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
+
     # Concatenate and process attention
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
@@ -239,6 +260,7 @@ def compute_layer_complete(
         device=query_states.device,
         dtype=query_states.dtype,
     )
+    # 第 242-244 行：RoPE 位置编码
     cos, sin = paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
     query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
         query_states, key_states, cos, sin, unsqueeze_dim=1
@@ -269,6 +291,7 @@ def compute_layer_complete(
         # first residual
         out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
         after_first_residual = out_emb.clone()
+        # Post-attention AdaRMS 归一化
         out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
@@ -334,7 +357,7 @@ class PaliGemmaWithExpertModel(
         super().__init__()
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
-        vlm_config_hf._vocab_size = 257152  # noqa: SLF001
+        vlm_config_hf._vocab_size = 257152  # noqa: SLF001，词表的大小
         vlm_config_hf.image_token_index = 257152
         vlm_config_hf.text_config.hidden_size = vlm_config.width
         vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
@@ -368,7 +391,7 @@ class PaliGemmaWithExpertModel(
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        self.gemma_expert.model.embed_tokens = None
+        self.gemma_expert.model.embed_tokens = None # Expert不需要token embedding
 
         self.to_bfloat16_for_selected_params(precision)
 
@@ -395,9 +418,13 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
+        # 输入: [B, 3, 224, 224] (归一化到 [-1, 1])
+        # 输出: [B, 196, 2048]  (14x14=196 个 patch，每个 patch 2048 维)
         return self.paligemma.model.get_image_features(image)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
+        # 输入: [B, seq_len] (token IDs)
+        # 输出: [B, seq_len, 2048]
         return self.paligemma.language_model.embed_tokens(tokens)
 
     def forward(
@@ -411,24 +438,24 @@ class PaliGemmaWithExpertModel(
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
-        if inputs_embeds[1] is None:
+        if inputs_embeds[1] is None: # 只处理prefix（image+language embed）
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                use_cache=use_cache,
+                use_cache=use_cache, # 关键：保存 KV cache
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
             )
-            prefix_past_key_values = prefix_output.past_key_values
+            prefix_past_key_values = prefix_output.past_key_values # kv cache保存
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
-        elif inputs_embeds[0] is None:
+        elif inputs_embeds[0] is None: # 只处理suffix（动作）
             suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                past_key_values=past_key_values, # 使用缓存的 prefix-KV
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
             )
@@ -437,7 +464,7 @@ class PaliGemmaWithExpertModel(
             prefix_past_key_values = None
         else:
             models = [self.paligemma.language_model, self.gemma_expert.model]
-            num_layers = self.paligemma.config.text_config.num_hidden_layers
+            num_layers = self.paligemma.config.text_config.num_hidden_layers # 共享所有层
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
@@ -508,7 +535,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
-
+        
+        # 单纯一个vlm模型 NOTE 和pi0区别，第二部分有adarms
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
@@ -599,16 +627,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+            img_emb = self._apply_checkpoint(image_embed_func, img) # [B, 196, 2048]
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-            att_masks += [0] * num_img_embs
+            att_masks += [0] * num_img_embs # 观察image-token设置为0
 
         # Process language tokens
         def lang_embed_func(tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens) # [B, seq_len, 2048]
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
@@ -617,9 +645,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks.append(masks)
 
         num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        att_masks += [0] * num_lang_embs # 观察lang-token设置为0
 
-        embs = torch.cat(embs, dim=1)
+        embs = torch.cat(embs, dim=1) # 图像和语言进行concat
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
@@ -636,29 +664,33 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
-            timestep,
+            timestep, # [B], 范围 [0, 1]
             self.action_in_proj.out_features,
             min_period=self.config.min_period,
             max_period=self.config.max_period,
             device=timestep.device,
-        )
+        ) # time_emb shape: [B, 1024]
         time_emb = time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
+        # 输入: [B, 50, 7] (chunk_size=50, action_dim=7)
+        # 输出: [B, 50, 1024]
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
+
         def time_mlp_func(time_emb):
-            x = self.time_mlp_in(time_emb)
+            x = self.time_mlp_in(time_emb) # [B, 1024] -> [B, 1024]
             x = F.silu(x)
-            x = self.time_mlp_out(x)
+            x = self.time_mlp_out(x) # [B, 1024] -> [B, 1024]
             return F.silu(x)
 
         time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
-        action_time_emb = action_emb
-        adarms_cond = time_emb
+        action_time_emb = action_emb # 只保留动作嵌入
+        adarms_cond = time_emb # 时间作为 AdaRMS 条件
+        # NOTE pi0.5 contribution，把时间步骤作为AdaRMS 条件，pi0是直接作为时间token
 
         embs.append(action_time_emb)
         bsize, action_time_dim = action_time_emb.shape[:2]
@@ -666,6 +698,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
+        # image和lang彼此可以看到，action符合因果atten
+        '''
+        # 注意力矩阵 (True = 可以attend):
+        #     O0  O1  O2  A0  A1  A2
+        # O0  T   T   T   F   F   F   <- 观察双向
+        # O1  T   T   T   F   F   F
+        # O2  T   T   T   F   F   F
+        # A0  F   F   F   T   F   F   <- 动作因果
+        # A1  F   F   F   T   T   F
+        # A2  F   F   F   T   T   T
+        '''
         att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
@@ -674,21 +717,25 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
-
+    
+    # MODE3, both suffix and prefix
     def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            noise = self.sample_noise(actions.shape, actions.device) # [B, 50, 7]
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(actions.shape[0], actions.device) # [B]
 
+        # Flow matching: 线性插值
+        # t=0: x_t = actions (真实动作)
+        # t=1: x_t = noise (纯噪声)
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks) # [B, 196 + seq_len, 2048]
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time) # suffix_embs: [B, 50, 1024]，adarms_cond: [B, 1024] (时间步条件)
 
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -697,14 +744,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
+        # 完整序列: [图像tokens, 语言tokens, 动作tokens]
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks) # [B, N, N]
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
+        # for inference in both prefix and suffix
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
@@ -720,8 +768,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out[:, -self.config.chunk_size :] # [B, 50, 1024]
+        suffix_out = suffix_out.to(dtype=torch.float32) # [B, 50, 7]
 
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
@@ -755,12 +803,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # for inference in prefix-only
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+            inputs_embeds=[prefix_embs, None], # suffix=None，只有前缀，采用MODE1
+            use_cache=True, # 保存 KV cache
         )
 
         dt = -1.0 / num_steps
@@ -768,7 +817,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
+        while time >= -dt / 2: # 循环num_steps次
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 prefix_pad_masks,
@@ -776,7 +825,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 x_t,
                 expanded_time,
             )
-            x_t = x_t + dt * v_t
+            x_t = x_t + dt * v_t # Euler 积分: x_t = x_t - 0.1 * v_t
             time += dt
 
         return x_t
@@ -791,27 +840,29 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
 
-        suffix_len = suffix_pad_masks.shape[1]
+        suffix_len = suffix_pad_masks.shape[1] # 50
         batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
+        prefix_len = prefix_pad_masks.shape[1] # 196 + seq_len
 
+        # suffix可以看到prefix + 自己的因果历史
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1 # 还要减去prefix的空位置
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # for inference in suffix-only
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            past_key_values=past_key_values, # 复用prefix的KV
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
-            adarms_cond=[None, adarms_cond],
+            adarms_cond=[None, adarms_cond], # 时间条件
         )
 
         suffix_out = outputs_embeds[1]

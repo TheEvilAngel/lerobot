@@ -67,6 +67,7 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
+    # 相同的sin和cos进行时间编码
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
@@ -85,6 +86,7 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
+    # 时间分布采样（非线形的）
     alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
     beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
     dist = torch.distributions.Beta(alpha_t, beta_t)

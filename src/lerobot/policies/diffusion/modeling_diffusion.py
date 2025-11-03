@@ -244,7 +244,7 @@ class DiffusionModel(nn.Module):
         {
             OBS_STATE: Tensor,      # shape: (B, n_obs_steps, state_dim) 机器人相关信息
             OBS_IMAGES: Tensor,     # shape: (B, n_obs_steps, n_cameras, C, H, W)
-            OBS_ENV_STATE: Tensor,  # shape: (B, n_obs_steps, env_state_dim)
+            OBS_ENV_STATE: Tensor,  # shape: (B, n_obs_steps, env_state_dim) 环境变量（比如PushT中T块的关键点坐标，T的大小）
         }
         output = # shape: (B, global_cond_dim)
         """

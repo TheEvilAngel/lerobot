@@ -228,6 +228,7 @@ class ACTTemporalEnsembler:
             self.ensembled_actions = actions.clone()
             # Note: The last dimension is unsqueeze to make sure we can broadcast properly for tensor
             # operations later.
+            # the count of avg in every position, such as position 1 is calculate in [count] times
             self.ensembled_actions_count = torch.ones(
                 (self.chunk_size, 1), dtype=torch.long, device=self.ensembled_actions.device
             )

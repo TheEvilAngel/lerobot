@@ -156,9 +156,51 @@ class PI05Pytorch:
 
 **为什么去掉 state_proj？**
 - π₀.₅ 使用 **Quantile Normalization**，也就是分桶量化了，将连续状态离散化
-- 离散状态可以直接作为 tokens，embed后的向量可以直接通过查表来完成，无需额外的投影层
+- 离散状态可以直接作为 tokens，embed后的向量可以直接通过查表来完成，state直接变成VLM中L的一部分无需额外的投影层
 - 减少参数量，提升泛化能力
 
+```
+                 ┌─────────────────────────┐
+[原始连续动作序列 a₁…H] ─▶│ ① 归一化 Normalization │─┐
+                 └─────────────────────────┘ │
+                                              ▼
+                               ┌───────────────────────────┐
+                               │ ② DCT 变换 (时域 → 频域) │
+                               └──────────────┬────────────┘
+                                              │
+                                              ▼
+                           ┌───────────────────────────────┐
+                           │ ③ 量化 Quantization（四舍五入）│
+                           └──────────────┬────────────────┘
+                                          │
+                                          ▼
+                        ┌──────────────────────────────────┐
+                        │ ④ 稀疏矩阵 → 展平 Flatten (低频优先) │
+                        └──────────────┬───────────────────┘
+                                       │
+                                       ▼
+                 ┌──────────────────────────────────────────────┐
+                 │ ⑤ BPE 编码（Byte Pair Encoding）             │
+                 │   - 统计高频符号对并合并                    │
+                 │   - 生成离散 token 序列                     │
+                 └──────────────────────────────────────────────┘
+                                       │
+                                       ▼
+                       ┌────────────────────────────────────┐
+                       │ ⑥ 输出：动作 Token 序列 [T₁, T₂, …] │
+                       └──────────────────┬─────────────────┘
+                                          │
+                                          ▼
+           ┌────────────────────────────────────────────────────┐
+           │ Transformer (Vision‑Language‑Action 模型训练)        │
+           └────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+               ┌──────────────────────────────┐
+               │ ⑦ 解码：BPE 解码 → 逆量化 → 逆 DCT │
+               │     → 重建连续动作 â₁…H             │
+               └──────────────────────────────┘
+```
 ---
 
 ### 4️⃣ **Tokenizer 长度**
@@ -1910,3 +1952,569 @@ pi05_model = load_pi0_checkpoint(pi05_model, "pi0_checkpoint.pth")
 ---
 
 **祝学习顺利！π₀.₅ 是目前最先进的 VLA 模型，掌握它将帮助你理解机器人学习的最新进展 🚀**
+
+---
+
+## 🔬 深入理解：State 处理与 Pretraining
+
+### 🤔 问题 1: π₀.₅ 是否使用 State？
+
+**答案：❌ π₀.₅ 完全不使用 State！**
+
+#### 对比分析
+
+| 特性 | π₀ | π₀.₅ |
+|------|-----|------|
+| **Config 中定义 state** | ✅ 有 `max_state_dim` | ✅ 有（但不用） |
+| **模型中使用 state** | ✅ 作为独立 token | ❌ 完全不用 |
+| **state_proj 层** | ✅ 有 | ❌ 无 |
+| **State 位置** | Suffix 第一个 token | N/A |
+| **State → Language** | ❌ 否，作为独立 token | ❌ 否，直接不用 |
+| **依赖的观察** | 图像 + 语言 + State | 仅图像 + 语言 |
+
+#### π₀ 的 State 使用
+
+```python
+# modeling_pi0.py:525
+self.state_proj = nn.Linear(max_state_dim, width)  # 专门的投影层
+
+# modeling_pi0.py:637-657
+def embed_suffix(self, state, noisy_actions, timestep):
+    # Step 1: 投影 state
+    state_emb = self.state_proj(state)  # [B, 32] -> [B, 1024]
+    embs.append(state_emb[:, None, :])  # 作为第一个 token
+
+    # Step 2: 投影 action
+    action_emb = self.action_in_proj(noisy_actions)
+
+    # Step 3: 时间拼接到 action
+    time_emb_expanded = time_emb[:, None, :].expand(-1, 50, -1)
+    action_time = torch.cat([action_emb, time_emb_expanded], dim=-1)
+
+    # 完整 suffix: [state, action_0, action_1, ..., action_49]
+    return torch.cat([state_emb, action_time_emb], dim=1)
+
+# modeling_pi0.py:1160
+state = self.prepare_state(batch)  # 从 batch 中提取 state
+```
+
+**π₀ 的 Suffix 结构：**
+```
+Suffix = [
+    state_token,      # 1 个 token [B, 1, 1024]
+    action_token_0,   # 第 1 步动作
+    action_token_1,   # 第 2 步动作
+    ...
+    action_token_49,  # 第 50 步动作
+]
+形状: [B, 51, 1024]  (1 个 state + 50 个 action)
+```
+
+#### π₀.₅ 不使用 State
+
+```python
+# modeling_pi05.py: 没有 state_proj 层！
+
+# modeling_pi05.py:659-719
+def embed_suffix(self, noisy_actions, timestep):
+    # ❌ 没有 state 参数！
+    # ✅ 只处理 action 和 timestep
+
+    # Step 1: 投影 action
+    action_emb = self.action_in_proj(noisy_actions)  # [B, 50, 1024]
+
+    # Step 2: 时间作为 AdaRMS 条件（不拼接）
+    time_emb = create_sinusoidal_pos_embedding(timestep, ...)
+    adarms_cond = time_mlp(time_emb)  # [B, 1024]
+
+    # 完整 suffix: 只有 action
+    return action_emb, adarms_cond  # [B, 50, 1024], [B, 1024]
+
+# modeling_pi05.py:722
+def forward(self, images, img_masks, tokens, masks, actions, ...):
+    # ❌ 没有 state 参数！
+```
+
+**π₀.₅ 的 Suffix 结构：**
+```
+Suffix = [
+    action_token_0,   # 第 1 步动作
+    action_token_1,   # 第 2 步动作
+    ...
+    action_token_49,  # 第 50 步动作
+]
+形状: [B, 50, 1024]  (只有 50 个 action tokens)
+```
+
+#### 为什么 Config 中还有 State 定义？
+
+```python
+# configuration_pi05.py:114-119
+if "observation.state" not in self.input_features:
+    state_feature = PolicyFeature(
+        type=FeatureType.STATE,
+        shape=(self.max_state_dim,),
+    )
+    self.input_features["observation.state"] = state_feature
+```
+
+**可能的原因：**
+1. **框架兼容性**: LeRobot 框架要求所有策略都定义 state feature
+2. **向后兼容**: 保持配置接口一致
+3. **未来扩展**: 可能后续版本会重新引入 state
+
+但在实际运行中，**π₀.₅ 完全忽略了 state 信息**，只依赖视觉和语言！
+
+---
+
+### 🎯 问题 2: π₀.₅ 的两阶段训练
+
+#### 训练阶段划分
+
+π₀.₅ 的完整训练分为两个阶段：
+
+##### **阶段 1: Pretraining（预训练）**
+
+**训练内容：**
+- **只训练 PaliGemma VLM**（视觉-语言模型）
+- **不训练 Action Expert**
+
+**使用的数据：**
+1. 多模态网络数据
+   - 图像描述（Image Captioning）
+   - 视觉问答（VQA）
+   - 目标检测（Object Detection）
+2. **离散动作 tokens**（来自 FAST）⭐
+3. 跨 embodiment 机器人数据
+4. 语言指令数据
+
+**训练任务：**
+1. **传统 VLM 任务**
+   ```python
+   # 示例：图像描述
+   输入: [image_tokens, prompt_tokens]
+   目标: 预测描述文本的下一个 token
+   损失: CrossEntropyLoss(logits, next_token)
+   ```
+
+2. **Predict Next Action Token**（π₀.₅ 的创新）⭐
+   ```python
+   # 使用 FAST 将连续动作离散化
+   actions_continuous = [0.1, 0.2, ...]  # [B, 50, 7]
+   action_tokens = FAST_tokenizer.encode(actions_continuous)  # [B, 50]
+   # 例如: [45231, 12043, 98234, ...]
+
+   # 输入序列
+   input_sequence = [
+       image_tokens,        # 196 个
+       language_tokens,     # N 个
+       action_tokens[:-1]   # 49 个（不包括最后一个）
+   ]
+
+   # VLM forward
+   outputs = paligemma.language_model.forward(
+       inputs_embeds=embed(input_sequence)
+   )
+   logits = paligemma.language_model.lm_head(outputs.last_hidden_state)
+   # logits shape: [B, seq_len, 257152] (词表大小)
+
+   # Next Token Prediction Loss
+   action_logits = logits[:, -(chunk_size-1):, :]  # 取动作部分
+   target_tokens = action_tokens[:, 1:]  # 目标是下一个 token
+   loss = CrossEntropyLoss(action_logits, target_tokens)
+   ```
+
+**关键点：**
+- VLM 的 `lm_head` (Linear: 2048 → 257152) 被用来预测动作 tokens
+- 动作被当作"特殊的语言"来学习
+- 让 VLM 理解动作序列的语义模式
+
+**与 π₀ 的区别：**
+- π₀: VLM 从 PaliGemma 初始化，参数不更新（只是特征提取器）
+- π₀.₅: VLM 参数**参与更新**，学习预测动作 tokens
+
+##### **阶段 2: Post-training/Fine-tuning（后训练）**
+
+**训练内容：**
+- **冻结 PaliGemma VLM**（参数不更新）
+- **只训练 Action Expert** 和相关投影层
+
+**使用的数据：**
+- 高质量的机器人操作演示数据
+- 特定任务的数据集（如 Libero）
+
+**训练方法：**
+```python
+# ===== 不再使用离散 tokens！ =====
+# ===== 改用连续动作空间 + Flow Matching =====
+
+# Step 1: 采样噪声和时间
+noise = torch.randn(B, 50, 7)  # 连续噪声
+time = sample_beta(1.5, 1.0, B)  # [0.001, 1.0]
+
+# Step 2: Flow Matching 前向过程
+x_t = time * noise + (1 - time) * actions  # 线性插值
+target_velocity = noise - actions
+
+# Step 3: 预测速度场（不用 lm_head）
+suffix_embs, adarms_cond = embed_suffix(x_t, time)
+suffix_hidden = action_expert.forward(
+    suffix_embs,
+    adarms_cond=adarms_cond  # 时间条件
+)
+
+# Step 4: 输出连续动作（不是 tokens）
+predicted_velocity = action_out_proj(suffix_hidden)  # [B, 50, 7]
+
+# Step 5: Flow Matching Loss
+loss = MSELoss(predicted_velocity, target_velocity)
+```
+
+**关键点：**
+- **lm_head 被丢弃**，不再使用
+- 改用 `action_out_proj` (Linear: 1024 → 7) 输出连续动作
+- VLM 只提供语义特征，不参与动作预测
+
+**目标：**
+- 将通用的视觉-语言理解转化为精确的机器人控制
+- 学习特定任务的操作策略
+
+#### 代码中的体现
+
+##### **Pretraining 阶段（未在 LeRobot 实现）**
+
+```python
+# ===== Physical Intelligence 的内部实现（未开源）=====
+
+class PI05Pretraining(nn.Module):
+    def __init__(self):
+        # 完整的 PaliGemma（包括 lm_head）
+        self.paligemma = PaliGemmaForConditionalGeneration(...)
+        # lm_head: Linear(2048, 257152) ← 用于预测 tokens
+
+        # FAST tokenizer（动作离散化）
+        self.fast_tokenizer = FAST_Tokenizer(...)
+
+    def forward(self, images, language, actions):
+        # 1. 离散化动作
+        action_tokens = self.fast_tokenizer.encode(actions)
+
+        # 2. 构建输入序列
+        input_ids = torch.cat([
+            image_token_ids,
+            language_token_ids,
+            action_tokens[:-1]  # 不包括最后一个
+        ], dim=1)
+
+        # 3. VLM forward（使用 lm_head）
+        outputs = self.paligemma(input_ids=input_ids)
+        logits = outputs.logits  # [B, seq_len, 257152]
+
+        # 4. 计算 next token prediction loss
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        loss = CrossEntropyLoss(shift_logits, shift_labels)
+
+        return loss
+```
+
+##### **Post-training 阶段（LeRobot 实现的部分）**
+
+```python
+# ===== modeling_pi05.py:722-779 =====
+
+class PI05Pytorch(nn.Module):
+    def __init__(self):
+        # PaliGemma（包含 lm_head，但不使用）
+        self.paligemma_with_expert = PaliGemmaWithExpertModel(...)
+        # paligemma.language_model.lm_head: Linear(2048, 257152) ← 存在但不用
+
+        # Action Expert
+        self.gemma_expert = GemmaForCausalLM(...)
+
+        # 投影层（用于连续动作）
+        self.action_in_proj = nn.Linear(7, 1024)
+        self.action_out_proj = nn.Linear(1024, 7)  # ← 实际使用这个
+
+    def forward(self, images, tokens, masks, actions, time):
+        # 1. 连续动作（不离散化）
+        x_t = time * noise + (1 - time) * actions
+
+        # 2. Embed suffix（不用 FAST tokens）
+        suffix_embs, adarms_cond = self.embed_suffix(x_t, time)
+
+        # 3. 双模型 forward（不用 lm_head）
+        suffix_hidden = self.paligemma_with_expert.forward(
+            prefix_embs,
+            suffix_embs,
+            adarms_cond=[None, adarms_cond]
+        )
+
+        # 4. 输出连续动作（不是 tokens）
+        predicted_velocity = self.action_out_proj(suffix_hidden)
+
+        # 5. Flow Matching Loss
+        loss = MSELoss(predicted_velocity, noise - actions)
+
+        return loss
+```
+
+#### lm_head 的"双重身份"
+
+**PaliGemma 的结构：**
+```python
+PaliGemmaForConditionalGeneration(
+    vision_tower: SiglipVisionModel,
+    multi_modal_projector: PaliGemmaMultiModalProjector,
+    language_model: GemmaForCausalLM(
+        model: GemmaModel,
+        lm_head: Linear(2048, 257152)  # ← 这里！
+    )
+)
+```
+
+**两种工作模式：**
+
+1. **Pretraining 模式**（Physical Intelligence 内部）：
+   ```python
+   # 使用 lm_head 预测离散 tokens
+   hidden_states = vlm.forward(image_tokens + lang_tokens + action_tokens)
+   next_token_logits = vlm.lm_head(hidden_states)  # [B, seq, 257152]
+   loss = CrossEntropyLoss(next_token_logits, target_tokens)
+   ```
+
+2. **Post-training 模式**（LeRobot 实现）：
+   ```python
+   # lm_head 存在但不使用！
+   hidden_states = vlm.forward(image_emb + lang_emb)
+   # vlm.lm_head 被忽略
+
+   # 改用 action_out_proj
+   action_features = expert.forward(action_emb, past_kv=hidden_states)
+   actions = action_out_proj(action_features)  # [B, 50, 7] 连续
+   loss = FlowMatchingLoss(actions, targets)
+   ```
+
+---
+
+### 🔍 问题 3: VLM 如何参与动作预测？
+
+#### 关键误解澄清
+
+**❌ 错误理解：** VLM 直接输出动作 tokens
+**✅ 正确理解：** VLM 通过 cross-attention 提供语义理解给 Expert
+
+#### 完整数据流
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    训练时的完整流程                          │
+└─────────────────────────────────────────────────────────────┘
+
+输入:
+├─ images: [B, 3, 224, 224]
+├─ language: "pick up the red cup"
+└─ actions: [B, 50, 7] (真实动作)
+
+Step 1: 准备输入
+├─ noise = randn([B, 50, 7])
+├─ time = Beta(1.5, 1.0) → [B]
+└─ x_t = time * noise + (1-time) * actions  # Flow Matching
+
+Step 2: Embed Prefix
+├─ image_emb = SigLIP(images)  # [B, 196, 2048]
+├─ lang_emb = Gemma_embed(tokens)  # [B, N, 2048]
+└─ prefix_embs = concat([image_emb, lang_emb])  # [B, 196+N, 2048]
+
+Step 3: Embed Suffix ⭐
+├─ action_emb = action_in_proj(x_t)  # [B, 50, 7] → [B, 50, 1024]
+│   # 注意：输入的是噪声混合的动作，不是 tokens！
+│
+└─ time_emb = sinusoidal_embed(time)  # [B, 1024]
+    adarms_cond = time_mlp(time_emb)  # [B, 1024]
+    # 时间不作为 token，而是 AdaRMS 条件
+
+Step 4: 双模型联合处理
+┌──────────────────────────────────────────────┐
+│  PaliGemma 处理 prefix                        │
+│  ├─ Layer 1-18                               │
+│  │  ├─ Self-Attention (双向，prefix内)      │
+│  │  ├─ Cross-Attention (看 prefix)          │
+│  │  └─ MLP                                  │
+│  └─ 输出: prefix_hidden [B, 196+N, 2048]     │
+└──────────────────────────────────────────────┘
+                │
+                ▼  (QKV concat)
+┌──────────────────────────────────────────────┐
+│  Action Expert 处理 suffix ⭐                 │
+│  ├─ Layer 1-18                               │
+│  │  ├─ AdaRMS(cond=adarms_cond) ⭐           │
+│  │  ├─ Self-Attention (因果，suffix内)      │
+│  │  ├─ Cross-Attention (可以看 prefix!)     │
+│  │  │   └─ Q: suffix, K/V: prefix + suffix │
+│  │  └─ MLP                                  │
+│  └─ 输出: suffix_hidden [B, 50, 1024]        │
+└──────────────────────────────────────────────┘
+                │
+                ▼
+Step 5: 输出连续动作
+└─ predicted_v = action_out_proj(suffix_hidden)  # [B, 50, 7]
+   loss = MSE(predicted_v, noise - actions)
+```
+
+#### 关键机制：Cross-Attention
+
+```python
+# compute_layer_complete() 中的关键代码
+# modeling_pi05.py:252-256
+
+# Step 1: 分别计算 QKV
+prefix_queries = paligemma.q_proj(prefix_hidden)  # [B, 196+N, 2048]
+suffix_queries = expert.q_proj(suffix_hidden)     # [B, 50, 1024]
+
+prefix_keys = paligemma.k_proj(prefix_hidden)
+suffix_keys = expert.k_proj(suffix_hidden)
+
+prefix_values = paligemma.v_proj(prefix_hidden)
+suffix_values = expert.v_proj(suffix_hidden)
+
+# Step 2: Concat（实现 cross-attention）⭐
+queries = torch.cat([prefix_queries, suffix_queries], dim=1)
+keys = torch.cat([prefix_keys, suffix_keys], dim=1)
+values = torch.cat([prefix_values, suffix_values], dim=1)
+
+# Step 3: 注意力计算
+attention_scores = (queries @ keys.transpose(-2, -1)) / sqrt(d_k)
+# 形状: [B, (196+N+50), (196+N+50)]
+
+# 应用 attention mask（控制谁能看到谁）
+attention_scores = attention_scores.masked_fill(~attention_mask, -inf)
+
+attention_weights = softmax(attention_scores, dim=-1)
+output = attention_weights @ values
+```
+
+**注意力矩阵可视化：**
+```
+         Prefix (196+N)     Suffix (50)
+        ┌──────────────────┬─────────────┐
+Prefix  │   双向 Attention  │   ❌ 看不到  │
+(196+N) │   (彼此可见)      │  (单向限制) │
+        ├──────────────────┼─────────────┤
+Suffix  │  ✅ 可以看到       │  因果 Attn  │
+(50)    │  (Cross-Attn!)   │  (只看过去) │
+        └──────────────────┴─────────────┘
+```
+
+**VLM 的语义如何传递给 Expert？**
+
+1. **通过 Cross-Attention 的 Key-Value**
+   ```python
+   # Suffix 的 Query 可以 attend 到 Prefix 的 Key-Value
+   suffix_query @ prefix_key → attention_weight
+   attention_weight @ prefix_value → 语义信息传递
+   ```
+
+2. **语义传递示例**
+   ```
+   语言指令: "pick up the red cup"
+   VLM 理解: [red, cup, pick, spatial_relation, ...]
+                     ↓ (通过 Cross-Attention)
+   Expert 获取: "我需要生成'拿起'的动作序列"
+                "目标是'红色的杯子'"
+                     ↓
+   生成动作: [approach, grasp, lift, ...]
+   ```
+
+#### 完整输入结构总结
+
+**给 Action Expert 的输入 token 长什么样？**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              完整输入序列（训练时）                       │
+├─────────────────────────┬───────────────────────────────┤
+│      Prefix             │           Suffix              │
+│   (VLM 处理)            │      (Expert 处理)            │
+├─────────────────────────┼───────────────────────────────┤
+│ Image Embeddings        │ Action Embeddings             │
+│   - Token 0-195 (196个) │   - Token 0-49 (50个)        │
+│   - [B, 196, 2048]      │   - [B, 50, 1024]            │
+│   - 来自 SigLIP         │   - 来自 action_in_proj       │
+│                         │                               │
+│ Language Embeddings     │ 关键点：                      │
+│   - Token 196-N         │ ❌ 不包含预测的动作 token     │
+│   - [B, seq_len, 2048]  │ ❌ 不包含离散 token           │
+│   - 来自 Gemma embed    │ ✅ 包含噪声混合的连续动作     │
+│                         │ ✅ 时间信息在 AdaRMS 条件中   │
+└─────────────────────────┴───────────────────────────────┘
+```
+
+**Suffix 的详细结构：**
+
+```python
+# 训练时
+noisy_actions = 0.3 * noise + 0.7 * actions  # [B, 50, 7]
+# 例如: [[0.2, 0.5, ...], [0.3, 0.4, ...], ...]
+
+action_emb = action_in_proj(noisy_actions)  # [B, 50, 1024]
+# 例如: [[e_0], [e_1], ..., [e_49]]
+# 每个 e_i 是 1024 维的连续嵌入
+
+# 推理时（迭代去噪）
+x_t = torch.randn(B, 50, 7)  # 初始纯噪声
+for step in range(10):
+    action_emb = action_in_proj(x_t)  # [B, 50, 1024]
+    v_t = model.forward(action_emb, ...)
+    x_t = x_t + v_t * dt  # 逐步变成干净动作
+```
+
+---
+
+### 📊 论文 vs 代码对应关系
+
+| 论文描述 | 代码位置 | 实现状态 | 说明 |
+|----------|----------|----------|------|
+| **Pretraining with FAST tokens** | ❌ 未实现 | Physical Intelligence 内部 | 使用 lm_head 预测离散 tokens |
+| **Predict next action token** | ❌ 未实现 | 需要 lm_head + FAST | Pretraining 的核心创新 |
+| **Post-training with Flow Matching** | ✅ 已实现 | [modeling_pi05.py:722-779](src/lerobot/policies/pi05/modeling_pi05.py#L722-L779) | LeRobot 实现的部分 |
+| **Action Expert** | ✅ 已实现 | [modeling_pi05.py:393](src/lerobot/policies/pi05/modeling_pi05.py#L393) | Gemma 300M |
+| **AdaRMS conditioning** | ✅ 已实现 | [modeling_pi05.py:692](src/lerobot/policies/pi05/modeling_pi05.py#L692) | 时间条件注入 |
+| **Cross-attention (VLM↔Expert)** | ✅ 已实现 | [modeling_pi05.py:252-256](src/lerobot/policies/pi05/modeling_pi05.py#L252-L256) | QKV concat 实现 |
+| **lm_head for action tokens** | ⚠️ 存在但不用 | 在 PaliGemma 中但被忽略 | Pretraining 用，Post-training 不用 |
+
+---
+
+### 🎓 核心要点总结
+
+1. **π₀.₅ 不使用 State**
+   - Config 中有定义（框架兼容性）
+   - 模型中完全不使用
+   - 依靠视觉观察隐式推断状态
+
+2. **两阶段训练的本质**
+   - **Pretraining**: VLM 学习预测动作 tokens（类似语言建模）
+   - **Post-training**: Expert 学习连续动作空间（Flow Matching）
+   - 两个阶段使用**完全不同的训练目标和损失函数**
+
+3. **VLM 的角色**
+   - ❌ 不直接输出动作 tokens
+   - ✅ 通过 Cross-Attention 提供语义理解
+   - ✅ 帮助 Expert 理解"拿起杯子"的意图
+
+4. **Expert 的输入**
+   - ❌ 不是离散的预测 tokens
+   - ✅ 是连续的噪声混合动作嵌入
+   - ✅ 通过 Cross-Attention 获取 VLM 的语义信息
+
+5. **lm_head 的"遗弃"**
+   - Pretraining 时使用（预测 tokens）
+   - Post-training 时不使用（改用 action_out_proj）
+   - 代码中存在但从未调用
+
+---
+
+这样的设计让 π₀.₅ 能够：
+- ✅ 在 Pretraining 阶段利用离散 tokens 学习通用语义
+- ✅ 在 Post-training 阶段切换到连续空间进行精确控制
+- ✅ 通过 Cross-Attention 实现 VLM 和 Expert 的有效协作

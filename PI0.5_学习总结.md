@@ -155,8 +155,8 @@ class PI05Pytorch:
 ```
 
 **为什么去掉 state_proj？**
-- π₀.₅ 使用 **Quantile Normalization**，将连续状态离散化
-- 离散状态可以直接作为 tokens，无需额外的投影层
+- π₀.₅ 使用 **Quantile Normalization**，也就是分桶量化了，将连续状态离散化
+- 离散状态可以直接作为 tokens，embed后的向量可以直接通过查表来完成，无需额外的投影层
 - 减少参数量，提升泛化能力
 
 ---

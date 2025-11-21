@@ -220,21 +220,21 @@ def compute_layer_complete(
     value_states = []
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        layer = models[i].layers[layer_idx] 
+        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  #  torch.Size([1, 560, 2048]) torch.Size([1, 51, 1024])
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim) # (1, 560, -1, 256)
+        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 8, 560, 256]) torch.Size([1, 8, 51, 256])
+        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 1, 560, 256]) torch.Size([1, 1, 51, 256])
+        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 1, 560, 256]) torch.Size([1, 1, 51, 256])
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
     # Concatenate and process attention
-    query_states = torch.cat(query_states, dim=2)
-    key_states = torch.cat(key_states, dim=2)
-    value_states = torch.cat(value_states, dim=2)
+    query_states = torch.cat(query_states, dim=2) # torch.Size([1, 8, 611, 256]) MQA行为, Q是8个头，其余只有1个头， 计算att的时候会把q投影到dim=8*256
+    key_states = torch.cat(key_states, dim=2) # torch.Size([1, 1, 611, 256])
+    value_states = torch.cat(value_states, dim=2) # torch.Size([1, 1, 611, 256])
     dummy_tensor = torch.zeros(
         query_states.shape[0],
         query_states.shape[2],
@@ -256,21 +256,21 @@ def compute_layer_complete(
         value_states,
         attention_mask,
         scaling,
-    )
+    ) # torch.Size([1, 611, 8, 256]) [batch, seq_len, num_heads, head_dim]
     # Get head_dim from the current layer, not from the model
     head_dim = paligemma.language_model.layers[layer_idx].self_attn.head_dim
-    att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+    att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim) # torch.Size([1, 611, 2048])
     # Process layer outputs
     outputs_embeds = []
     start_pos = 0
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        end_pos = start_pos + hidden_states.shape[1]
+        end_pos = start_pos + hidden_states.shape[1] # 560/51
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos]) # 分开各自进行
         # first residual
-        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001 torch.Size([1, 560, 2048]) torch.Size([1, 51, 1024])
         after_first_residual = out_emb.clone()
         out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
@@ -605,7 +605,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+            img_emb = self._apply_checkpoint(image_embed_func, img) # torch.Size([1, 3, 224, 224]) -> torch.Size([1, 256, 2048])
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -618,16 +618,16 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens) # torch.Size([1, 48]) -> torch.Size([1, 48, 2048])
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        embs = torch.cat(embs, dim=1) # torch.Size([1, 560, 2048]) 560=256*2+48
+        pad_masks = torch.cat(pad_masks, dim=1) # torch.Size([1, 560])
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device) # torch.Size([1, 560])
 
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
@@ -646,7 +646,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         def state_proj_func(state):
             return self.state_proj(state)
 
-        state_emb = self._apply_checkpoint(state_proj_func, state)
+        state_emb = self._apply_checkpoint(state_proj_func, state) # torch.Size([1, 1024])
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]
         device = state_emb.device
@@ -663,23 +663,23 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             max_period=self.config.max_period,
             device=timestep.device,
         )
-        time_emb = time_emb.type(dtype=timestep.dtype)
+        time_emb = time_emb.type(dtype=timestep.dtype) # torch.Size([1, 1024])
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
-        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions) # torch.Size([1, 50, 1024])
 
         time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2) # torch.Size([1, 50, 2048])
 
         def mlp_func(action_time_emb):
             x = self.action_time_mlp_in(action_time_emb)
             x = F.silu(x)
             return self.action_time_mlp_out(x)
 
-        action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+        action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb) # # torch.Size([1, 50, 2048])
         adarms_cond = None
 
         embs.append(action_time_emb)
@@ -690,10 +690,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Set attention masks so that image, language and state inputs do not attend to action tokens
         att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        embs = torch.cat(embs, dim=1) # torch.Size([1, 51, 1024]) state + action
+        pad_masks = torch.cat(pad_masks, dim=1) # torch.Size([1, 51])
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device) # torch.Size([1, 51])
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks)) # torch.Size([1, 51])
 
         return embs, pad_masks, att_masks, adarms_cond
 
@@ -713,8 +713,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        ) # torch.Size([1, 560, 2048]), torch.Size([1, 560]), torch.Size([1, 560])
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time) # torch.Size([1, 51, 1024])
 
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -723,13 +723,13 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1) # torch.Size([1, 611])
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1) # torch.Size([1, 611])
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks) # torch.Size([1, 611, 611])
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks) # torch.Size([1, 1, 611, 611])
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
@@ -739,20 +739,20 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
-            )
+            )# torch.Size([1, 560, 2048]), # torch.Size([1, 51, 1024])
             return suffix_out
 
         suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out[:, -self.config.chunk_size :] # torch.Size([1, 50, 1024])
+        suffix_out = suffix_out.to(dtype=torch.float32) # torch.Size([1, 50, 1024])
 
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out) # torch.Size([1, 50, 32])
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
@@ -1181,8 +1181,8 @@ class PI0Policy(PreTrainedPolicy):
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
 
         # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        original_action_dim = self.config.output_features[ACTION].shape[0] 
+        losses = losses[:, :, :original_action_dim] # torch.Size([1, 50, 7])
 
         loss = losses.mean()
 
